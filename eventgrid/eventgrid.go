@@ -7,8 +7,10 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Azure-Samples/azure-sdk-for-go-samples/helpers"
 	"github.com/Azure-Samples/azure-sdk-for-go-samples/iam"
@@ -56,27 +58,41 @@ func CreateTopic(ctx context.Context, name string) (created mgmt.Topic, err erro
 	return
 }
 
-func CreateEndpoint(ctx context.Context, address string) {
-
-}
-
 // MockTopic creates a local message dispatcher, loosely emulating an Azure hosted
 // EventGrid for the sake of the examples in this package. If you ever find yourself
 // wanting to take a dependency on this, you should really ask yourself if you:
 //    A) Need a real instance of EventGrid.
 //    B) Can do something lighter-weight with channels directly.
-type MockTopic struct {
-	sync.RWMutex
-	subscribers map[mockTopicSubscribers]struct{}
+type (
+	MockTopic struct {
+		sync.RWMutex
+		subscribers []mockTopicSubscribers
+		startAddr   *url.URL
+	}
+
+	mockTopicSubscribers struct {
+		callback func(context.Context, eventgrid.Event) int
+		filter   *mgmt.EventSubscriptionFilter
+	}
+)
+
+func NewMockTopic() (result *MockTopic, err error) {
+	result = new(MockTopic)
+	result.subscribers = make([]mockTopicSubscribers, 0)
+	return
 }
 
-type mockTopicSubscribers struct {
-	callback func(context.Context, eventgrid.Event) int
-	filter   *mgmt.EventSubscriptionFilter
-}
+func (mt *MockTopic) ListenAndServe(addr string) (err error) {
+	mt.Lock()
+	defer mt.Unlock()
+	defer func() { mt.startAddr = nil }()
 
-func (mt *MockTopic) ListenAndServe(addr string) error {
+	if mt.startAddr, err = url.Parse(addr); err != nil {
+		return
+	}
+
 	http.HandleFunc("/", mt.handler)
+	fmt.Println("Starting server")
 	return http.ListenAndServe(addr, nil)
 }
 
@@ -105,15 +121,19 @@ func (mt *MockTopic) handler(w http.ResponseWriter, req *http.Request) {
 	defer cancel()
 
 	for _, event := range payload {
-		for sub := range mt.subscribers {
-			if applyFilter(sub.filter, event) {
-
+		for _, sub := range mt.subscribers {
+			if passesFilter(sub.filter, event) {
+				timeLimited, subCancel := context.WithTimeout(ctx, 60*time.Second)
+				go func() {
+					sub.callback(timeLimited, event)
+					subCancel()
+				}()
 			}
 		}
 	}
 }
 
-func applyFilter(filter *mgmt.EventSubscriptionFilter, event eventgrid.Event) bool {
+func passesFilter(filter *mgmt.EventSubscriptionFilter, event eventgrid.Event) bool {
 	if filter.IncludedEventTypes != nil && event.EventType != nil {
 		foundEventType := false
 		for _, included := range *filter.IncludedEventTypes {
@@ -127,10 +147,24 @@ func applyFilter(filter *mgmt.EventSubscriptionFilter, event eventgrid.Event) bo
 		}
 	}
 
-	var eventSubject 
+	return true
 }
 
+// Endpoint fetches the URI that can be used to submit new Events.
 func (mt *MockTopic) Endpoint() string {
+	mt.RLock()
+	defer mt.RUnlock()
+
+	if mt.startAddr == nil {
+		return ""
+	}
+
+	copy := *mt.startAddr
+	if copy.Host == "" {
+		copy.Host = "localhost"
+	}
+
+	return copy.String()
 }
 
 // Subscribe mimicks the functionality of registering an Event Handler with a Topic via ARM operations.
